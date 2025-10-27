@@ -7,6 +7,13 @@ from pulp import (
     LpBinary, LpMinimize, LpProblem, LpStatus, LpVariable,
     PULP_CBC_CMD, lpSum
 )
+import customtkinter as ctk
+ctk.set_appearance_mode("dark")
+
+root = ctk.CTk()
+root.title("Planificador de Auditorías")
+
+
 
 def read_speeds(csv_path: Path) -> pd.DataFrame:
     df = pd.read_csv(csv_path, sep=";")
@@ -38,16 +45,23 @@ def solve_lp(speeds: pd.DataFrame, auditors: List[str], demand: Dict[str, int],
              objective: str = "total", min_pair: int = 0):
     spd = speeds[speeds["auditor"].isin(auditors)].copy()
     spd = fill_missing(spd)
+
+    # Clampeamos velocidades mínimas (nadie más rápido que 0.5 min/tarea)
+    spd["avg_speed"] = spd["avg_speed"].clip(lower=0.5)
+
     auds = sorted(spd["auditor"].unique())
     tasks = sorted(demand)
     time_pt = {
         (a, t): spd.loc[(spd["auditor"] == a) & (spd["task_type"] == t), "avg_speed"].iloc[0]
         for a in auds for t in tasks
     }
+
     prob = LpProblem("asignacion", LpMinimize)
     x = {(a, t): LpVariable(f"x_{a}_{t}", lowBound=0, cat="Integer") for a in auds for t in tasks}
     y = {(a, t): LpVariable(f"y_{a}_{t}", cat=LpBinary) for a in auds for t in tasks}
     BIG = max(max(demand.values()), min_pair) * len(auds)
+
+    # Función objetivo
     if objective == "total":
         prob += lpSum(x[a, t] * time_pt[a, t] for a in auds for t in tasks)
     else:
@@ -55,26 +69,42 @@ def solve_lp(speeds: pd.DataFrame, auditors: List[str], demand: Dict[str, int],
         for a in auds:
             prob += lpSum(x[a, t] * time_pt[a, t] for t in tasks) <= M
         prob += M
+
+    # Restricción de demanda total
     for t in tasks:
         prob += lpSum(x[a, t] for a in auds) == demand[t]
+
+    # Si hay un mínimo por par
     if min_pair > 0:
         for a in auds:
             for t in tasks:
                 prob += x[a, t] >= min_pair * y[a, t]
                 prob += x[a, t] <= BIG * y[a, t]
+
+    # 🔹 NUEVAS RESTRICCIONES DE BALANCE
+    total_tasks = sum(demand.values())
+    for a in auds:
+        prob += lpSum(x[a, t] for t in tasks) >= 0.05 * total_tasks  # mínimo 5%
+        prob += lpSum(x[a, t] for t in tasks) <= 0.4 * total_tasks   # máximo 40%
+
     prob.solve(PULP_CBC_CMD(msg=False))
+
     if LpStatus[prob.status] != "Optimal":
         raise RuntimeError("No se encontró solución óptima")
+
     plan_rows = [(a, t, int(var.value()), time_pt[a, t]) for (a, t), var in x.items() if int(var.value()) > 0]
     plan = pd.DataFrame(plan_rows, columns=["auditor", "task_type", "tasks", "avg_speed"])
     plan["estimated_minutes"] = plan["tasks"] * plan["avg_speed"]
+
     resumen = plan.groupby("auditor")["estimated_minutes"].sum().apply(lambda m: pd.to_timedelta(m, unit="m"))
     resumen = resumen.dt.components[["hours", "minutes"]]
     resumen["HH:mm"] = resumen["hours"].astype(str).str.zfill(2) + ":" + resumen["minutes"].astype(str).str.zfill(2)
     resumen = resumen[["HH:mm"]].reset_index()
     return plan, resumen
 
+
 def launch_gui():
+
     def load_csv():
         path = filedialog.askopenfilename(filetypes=[("CSV files", "*.csv")])
         if path:
@@ -85,10 +115,10 @@ def launch_gui():
                 for widget in auditor_frame.winfo_children():
                     widget.destroy()
                 for a in auditors:
-                    var = tk.BooleanVar()
-                    auditor_vars[a] = var
-                    cb = ttk.Checkbutton(auditor_frame, text=a, variable=var)
+                    var = ctk.IntVar(value=0) 
+                    cb = ctk.CTkCheckBox(auditor_frame, text=a, variable=var, onvalue=1, offvalue=0, text_color="black")
                     cb.pack(anchor="w")
+                    auditor_vars[a] = var
                 for widget in demand_frame.winfo_children():
                     widget.destroy()
                 for t in sorted(speeds["task_type"].unique()):
@@ -103,8 +133,9 @@ def launch_gui():
                 messagebox.showerror("Error", str(e))
 
     def run_optimization():
+        print(speeds.groupby("auditor")["avg_speed"].mean().sort_values())
         try:
-            seleccionados = [a for a, v in auditor_vars.items() if v.get()]
+            seleccionados = [a for a, v in auditor_vars.items() if v.get() == 1]
             if not seleccionados:
                 raise ValueError("Selecciona al menos un auditor")
             demand = {t: int(e.get() or "0") for t, e in demand_entries.items()}
